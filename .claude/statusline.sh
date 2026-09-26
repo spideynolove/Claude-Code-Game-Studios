@@ -1,209 +1,237 @@
-#!/usr/bin/env bash
-
-# --- work from the project root ----------------------------------------------
-# Every path below is repo-relative, so a hook invoked with a working directory
-# that is not the repo root would silently read and write the WRONG TREE --
-# returning a near-empty result instead of the session-recovery block, and
-# creating stray trees such as docs/production/session-logs/ on write.
+#!/bin/bash
+# Custom Claude Code statusline for Bash
+# Cross-platform support: macOS, Linux
+# Theme: detailed | Features: directory, git, model, usage, session, tokens
 #
-# PRECEDENCE IS LOAD-BEARING. A cwd that IS a project root carries real
-# information and must win: a caller sitting inside another project means that
-# project, not this one. Resolving to the script's own location first would
-# override them. So, in order:
-#   1. cwd holds project.yaml   -> cwd   (a project root)
-#   2. cwd holds .claude/       -> cwd   (a project root not yet configured)
-#   3. CLAUDE_PROJECT_DIR       -> that  (populated in the hook environment)
-#   4. this script's location   -> <root>/.claude/hooks/../.. by construction
-# Rule 4 always works and needs no environment at all; rules 1-2 stop it from
-# overriding a caller that legitimately means somewhere else.
-#
-# NOT an upward search: that resolves a nested project to its parent's config.
-if [ -f "project.yaml" ] || [ -d ".claude" ]; then
-  CCGS_ROOT="$PWD"
-elif [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -d "${CLAUDE_PROJECT_DIR}" ]; then
-  CCGS_ROOT="$CLAUDE_PROJECT_DIR"
-else
-  CCGS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
-fi
-[ -n "$CCGS_ROOT" ] && cd "$CCGS_ROOT" 2>/dev/null || true
-
-# Claude Code Game Studios — Status Line
-# Receives JSON on stdin, outputs a single-line status.
-#
-# Segments: ctx% | model | production stage [| Epic > Feature > Task]
+# Context Window Calculation:
+# - 100% = compaction threshold (not model limit)
+# - Self-calibrates via PreCompact hook
+# - Falls back to smart defaults based on window size
 
 input=$(cat)
 
-# --- Parse JSON (jq with grep fallback) ---
-if command -v jq &>/dev/null; then
-  model=$(echo "$input" | jq -r '.model.display_name // "Unknown"')
-  used_pct=$(echo "$input" | jq -r '.context_window.used_percentage // empty')
-  cwd=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // ""')
-else
-  model=$(echo "$input" | grep -oE '"display_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*: *"//;s/"//')
-  used_pct=$(echo "$input" | grep -oE '"used_percentage"[[:space:]]*:[[:space:]]*[0-9]+' | head -1 | sed 's/.*: *//')
-  cwd=$(echo "$input" | grep -oE '"current_dir"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*: *"//;s/"//')
-  [ -z "$model" ] && model="Unknown"
-fi
+# Calibration file path (now in /tmp/ck/ namespace - fixes #178)
+CALIBRATION_PATH="${TMPDIR:-/tmp}/ck/calibration.json"
 
-# Normalize Windows paths
-cwd=$(echo "$cwd" | sed 's|\\|/|g')
-[ -z "$cwd" ] && cwd="."
+# ---- time helpers ----
+to_epoch() {
+  ts="$1"
+  if command -v gdate >/dev/null 2>&1; then gdate -d "$ts" +%s 2>/dev/null && return; fi
+  date -u -j -f "%Y-%m-%dT%H:%M:%S%z" "${ts/Z/+0000}" +%s 2>/dev/null && return
+  python3 - "$ts" <<'PY' 2>/dev/null
+import sys, datetime
+s=sys.argv[1].replace('Z','+00:00')
+print(int(datetime.datetime.fromisoformat(s).timestamp()))
+PY
+}
 
-# --- Context usage ---
-if [ -n "$used_pct" ]; then
-  ctx_label="ctx: ${used_pct}%"
-else
-  ctx_label="ctx: --"
-fi
+fmt_time_hm() {
+  epoch="$1"
+  if date -r 0 +%s >/dev/null 2>&1; then date -r "$epoch" +"%H:%M"; else date -d "@$epoch" +"%H:%M"; fi
+}
 
-# --- Production stage ---
-# Priority 1: project.stage from project.yaml
-stage=""
-project_yaml="$cwd/project.yaml"
-yaml_helper="$cwd/.claude/hooks/yaml-helper.sh"
-if [ -f "$project_yaml" ] && [ -f "$yaml_helper" ]; then
-  source "$yaml_helper"
-  stage=$(get_yaml_key "$project_yaml" project.stage 2>/dev/null)
-fi
-# Priority 2: legacy stage.txt fallback
-if [ -z "$stage" ]; then
-  stage_file="$cwd/production/stage.txt"
-  if [ -f "$stage_file" ]; then
-    stage=$(head -1 "$stage_file" | tr -d '\r\n')
+# ---- compact threshold calculation ----
+# Get smart default compact threshold based on context window size
+# Research-based defaults:
+# - 200k window: ~80% (160k) - confirmed from GitHub issues
+# - 500k window: ~60% (300k) - estimated
+# - 1M window: ~33% (330k) - derived from user observations
+get_default_compact_threshold() {
+  local context_size="$1"
+
+  # Known thresholds (autocompact buffer = 22.5% for 200k)
+  case "$context_size" in
+    200000) echo 155000; return ;;  # 77.5% - confirmed via /context
+    1000000) echo 330000; return ;; # 33% - 1M beta window
+  esac
+
+  # Tiered defaults based on window size
+  if [ "$context_size" -ge 1000000 ] 2>/dev/null; then
+    echo $((context_size * 33 / 100))
+  else
+    # Default: ~77.5% for standard windows (200k confirmed)
+    echo $((context_size * 775 / 1000))
   fi
-fi
+}
 
-# Priority 3: Auto-detect from artifacts
-if [ -z "$stage" ]; then
-  concept_file="$cwd/design/gdd/game-concept.md"
-  systems_file="$cwd/design/gdd/systems-index.md"
-  tech_prefs="$cwd/.claude/docs/technical-preferences.md"
+# Read calibrated threshold from file if available
+get_compact_threshold() {
+  local context_size="$1"
 
-  has_concept=false
-  has_systems=false
-  engine_configured=false
-  src_count=0
-
-  [ -f "$concept_file" ] && has_concept=true
-  [ -f "$systems_file" ] && has_systems=true
-
-  # Check if engine is configured (project.yaml first, fall back to technical-preferences.md)
-  if [ -f "$project_yaml" ] && [ -f "$yaml_helper" ]; then
-    # yaml-helper may have been sourced above for stage; sourcing again is idempotent
-    source "$yaml_helper"
-    engine_name=$(get_yaml_key "$project_yaml" engine.name 2>/dev/null)
-    [ -n "$engine_name" ] && engine_configured=true
-  fi
-  if [ "$engine_configured" = false ] && [ -f "$tech_prefs" ]; then
-    # Leading whitespace tolerated, matching detect-gaps.sh and the migrator.
-    # This is the THIRD copy of "is the engine configured in
-    # technical-preferences.md" in the tree, and it was the last one still
-    # anchored to column 0 -- an indented bullet read as unconfigured here while
-    # the other two read it as configured, so the auto-detect ladder below
-    # dropped the project to an earlier stage than the rest of the system saw.
-    engine_line=$(grep -m1 -E '^[[:space:]]*-[[:space:]]+\*\*Engine\*\*:' "$tech_prefs" 2>/dev/null || true)
-    if [ -n "$engine_line" ] && ! echo "$engine_line" | grep -q "TO BE CONFIGURED"; then
-      engine_configured=true
+  # Try to read calibration file
+  if [ -f "$CALIBRATION_PATH" ] && command -v jq >/dev/null 2>&1; then
+    local calibrated
+    calibrated=$(jq -r --arg key "$context_size" '.[$key].threshold // empty' "$CALIBRATION_PATH" 2>/dev/null)
+    if [ -n "$calibrated" ] && [ "$calibrated" -gt 0 ] 2>/dev/null; then
+      echo "$calibrated"
+      return
     fi
   fi
 
-  # Count source files (language-agnostic)
-  if [ -d "$cwd/src" ]; then
-    src_count=$(find "$cwd/src" -type f \( -name "*.gd" -o -name "*.cs" -o -name "*.cpp" -o -name "*.h" -o -name "*.py" -o -name "*.rs" -o -name "*.lua" -o -name "*.tscn" -o -name "*.tres" \) 2>/dev/null | wc -l | tr -d ' ')
-  fi
+  # Fall back to smart defaults
+  get_default_compact_threshold "$context_size"
+}
 
-  # Check for ADRs (signals Pre-Production phase)
-  has_adrs=false
-  if ls "$cwd/docs/architecture/"adr-*.md 2>/dev/null | head -1 | grep -q .; then
-    has_adrs=true
-  fi
+# ---- progress bar ----
+progress_bar() {
+  pct="${1:-0}"; width="${2:-12}"
+  [[ "$pct" =~ ^[0-9]+$ ]] || pct=0; ((pct<0))&&pct=0; ((pct>100))&&pct=100
+  filled=$(( pct * width / 100 )); empty=$(( width - filled ))
+  # ▰ (U+25B0) filled, ▱ (U+25B1) empty - smooth horizontal rectangles
+  for ((i=0; i<filled; i++)); do printf '▰'; done
+  for ((i=0; i<empty; i++)); do printf '▱'; done
+}
 
-  # Determine stage (check from most-advanced backward)
-  if [ "$src_count" -ge 10 ] 2>/dev/null; then
-    stage="Production"
-  elif [ "$has_adrs" = true ]; then
-    stage="Pre-Production"
-  elif [ "$engine_configured" = true ]; then
-    stage="Technical Setup"
-  elif [ "$has_systems" = true ]; then
-    stage="Systems Design"
-  elif [ "$has_concept" = true ]; then
-    stage="Concept"
+# ---- severity emoji (no colors) ----
+get_severity_emoji() {
+  local pct="$1"
+  if [ "$pct" -ge 90 ] 2>/dev/null; then
+    echo "🔴"      # Critical
+  elif [ "$pct" -ge 70 ] 2>/dev/null; then
+    echo "🟡"      # Warning
   else
-    stage="Concept"
+    echo "🟢"      # Healthy
   fi
+}
+
+# git utilities
+num_or_zero() { v="$1"; [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0; }
+
+# ---- git (detect early for fallback mode) ----
+git_branch=""
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  git_branch=$(git branch --show-current 2>/dev/null || git rev-parse --short HEAD 2>/dev/null)
 fi
 
-# --- Process posture (modes.rigor) ---
-# Locked to project.yaml (not locally overridable) with a plain terminal default
-# of 'standard', so a direct get_yaml_key read + default is exact. Deliberately
-# NOT resolve_setting: that assumes PWD is the project root, unsafe here since the
-# status line works from an absolute $cwd and never cd's.
-#
-# The 'standard' default applies ONLY when nothing contradicts it. If `rigor` is
-# unset but a knob it fronts is set explicitly, the project's real process weight
-# is whatever that knob says, and printing 'standard' actively misreports it —
-# migration is the common case, writing `modes.review_mode` and no `modes.rigor`,
-# so every v1.0 upgrader running full director reviews read 'Production · standard'.
-# Suppress instead of guessing, matching the unconfigured-project behaviour: no
-# config, no claim. Suppression is correct rather than lossy — the fronted knobs
-# disagree with each other in this state, so there is no single honest posture.
-rigor=""
-if [ -f "$project_yaml" ] && [ -f "$yaml_helper" ]; then
-  source "$yaml_helper"
-  rigor=$(get_yaml_key "$project_yaml" modes.rigor 2>/dev/null)
-  if [ -z "$rigor" ]; then
-    rigor="standard"
-    # Cheap pre-filter first. This hook runs every turn, and the common case
-    # (nothing fronted set) must not cost a get_yaml_key subprocess per key.
-    # The grep is a deliberate SUPERSET — it matches the leaf names anywhere at
-    # depth, so a false positive only costs the precise checks below, while a
-    # miss is impossible. Never let it decide on its own: a bare `size:` under
-    # some unrelated block would suppress the posture with no reason.
-    _fronted='^[[:space:]]+(review_mode|workflow|density|level|story_granularity|size):[[:space:]]*[^[:space:]#]'
-    for _f in "$project_yaml" "$cwd/project.local.yaml"; do
-      [ -f "$_f" ] || continue
-      grep -qE "$_fronted" "$_f" 2>/dev/null || continue
-      for _k in modes.review_mode modes.workflow docs.density qa.level \
-                modes.story_granularity team.size; do
-        if [ -n "$(get_yaml_key "$_f" "$_k" 2>/dev/null)" ]; then rigor=""; break; fi
-      done
-      [ -z "$rigor" ] && break
-    done
+# ---- basics ----
+if command -v jq >/dev/null 2>&1; then
+  current_dir=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // "unknown"' 2>/dev/null | sed "s|^$HOME|~|g")
+  model_name=$(echo "$input" | jq -r '.model.display_name // "Claude"' 2>/dev/null)
+  model_version=$(echo "$input" | jq -r '.model.version // ""' 2>/dev/null)
+else
+  # Fallback: Extract basic info without jq using grep/sed
+  current_dir=$(echo "$input" | grep -o '"current_dir"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*:.*"\([^"]*\)".*/\1/' | sed "s|^$HOME|~|g")
+  [ -z "$current_dir" ] && current_dir=$(pwd | sed "s|^$HOME|~|g")
+  model_name=$(echo "$input" | grep -o '"display_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*:.*"\([^"]*\)".*/\1/')
+  [ -z "$model_name" ] && model_name="Claude"
+  model_version=""
+  # Render minimal statusline without jq and exit
+  printf '📁 %s' "$current_dir"
+  if [ -n "$git_branch" ]; then
+    printf '  🌿 %s' "$git_branch"
   fi
+  printf '  🤖 %s' "$model_name"
+  printf '\n'
+  exit 0
 fi
 
-# --- Epic/Feature/Task breadcrumb (Production+ only) ---
-breadcrumb=""
-if [ "$stage" = "Production" ] || [ "$stage" = "Polish" ] || [ "$stage" = "Release" ]; then
-  state_file="$cwd/production/session-state/active.md"
-  if [ -f "$state_file" ]; then
-    # Parse structured STATUS block
-    in_block=false
-    epic="" feature="" task=""
-    while IFS= read -r line; do
-      case "$line" in
-        *"<!-- STATUS -->"*) in_block=true; continue ;;
-        *"<!-- /STATUS -->"*) break ;;
-      esac
-      if [ "$in_block" = true ]; then
-        case "$line" in
-          Epic:*) epic=$(echo "$line" | sed 's/^Epic: *//') ;;
-          Feature:*) feature=$(echo "$line" | sed 's/^Feature: *//') ;;
-          Task:*) task=$(echo "$line" | sed 's/^Task: *//') ;;
-        esac
+# ---- Native Claude Code data integration ----
+session_txt=""
+cost_usd=""; lines_added=0; lines_removed=0
+context_pct=0; context_txt=""
+BILLING_MODE="${CLAUDE_BILLING_MODE:-api}"
+
+# Extract native cost data from Claude Code
+cost_usd=$(echo "$input" | jq -r '.cost.total_cost_usd // empty' 2>/dev/null)
+lines_added=$(echo "$input" | jq -r '.cost.total_lines_added // 0' 2>/dev/null)
+lines_removed=$(echo "$input" | jq -r '.cost.total_lines_removed // 0' 2>/dev/null)
+
+# Extract context window usage (Claude Code v2.0.65+)
+# Calculate percentage against COMPACT THRESHOLD, not model limit
+# 100% = compaction imminent
+context_input=$(echo "$input" | jq -r '.context_window.total_input_tokens // 0' 2>/dev/null)
+context_output=$(echo "$input" | jq -r '.context_window.total_output_tokens // 0' 2>/dev/null)
+context_size=$(echo "$input" | jq -r '.context_window.context_window_size // 0' 2>/dev/null)
+
+if [ -n "$context_size" ] && [ "$context_size" -gt 0 ] 2>/dev/null; then
+  context_total=$((context_input + context_output))
+  compact_threshold=$(get_compact_threshold "$context_size")
+
+  # Calculate percentage against compact threshold
+  context_pct=$((context_total * 100 / compact_threshold))
+  # Clamp to 100% max to handle edge cases
+  ((context_pct > 100)) && context_pct=100
+
+  # Get severity emoji and progress bar
+  severity_emoji=$(get_severity_emoji "$context_pct")
+  bar=$(progress_bar "$context_pct" 12)
+  context_txt="${severity_emoji} ${bar} ${context_pct}%"
+fi
+
+# Session timer - parse local transcript JSONL (zero external dependencies)
+transcript_path=$(echo "$input" | jq -r '.transcript_path // empty' 2>/dev/null)
+
+if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
+  # Get first API call timestamp from session JSONL
+  first_api_call=$(grep -m1 '"usage"' "$transcript_path" 2>/dev/null | jq -r '.timestamp // empty' 2>/dev/null)
+
+  if [ -n "$first_api_call" ]; then
+    # Calculate 5-hour billing block (Anthropic windows)
+    # Blocks: 00:00-05:00, 05:00-10:00, 10:00-15:00, 15:00-20:00, 20:00-01:00 UTC
+    current_utc_hour=$(date -u +%H)
+    block_start=$((10#$current_utc_hour / 5 * 5))
+    block_end=$((block_start + 5))
+
+    # Handle day wraparound (e.g., 20:00 UTC block ends at 01:00 UTC next day)
+    if [ $block_end -ge 24 ]; then
+      block_end=$((block_end - 24))
+      block_end_date="tomorrow"
+    else
+      block_end_date="today"
+    fi
+
+    # Calculate remaining time until block reset
+    now_sec=$(date +%s)
+    block_end_sec=$(date -u -d "${block_end_date} ${block_end}:00 UTC" +%s 2>/dev/null)
+
+    if [ -n "$block_end_sec" ] && [ "$block_end_sec" -gt 0 ]; then
+      remaining=$((block_end_sec - now_sec))
+
+      if [ $remaining -gt 0 ] && [ $remaining -lt 18000 ]; then
+        rh=$((remaining / 3600))
+        rm=$(((remaining % 3600) / 60))
+        block_end_local=$(date -d "@${block_end_sec}" +"%H:%M" 2>/dev/null)
+        session_txt="${rh}h ${rm}m until reset at ${block_end_local}"
       fi
-    done < "$state_file"
-
-    # Build breadcrumb from whatever is set
-    parts=""
-    [ -n "$epic" ] && parts="$epic"
-    [ -n "$feature" ] && parts="${parts:+$parts > }$feature"
-    [ -n "$task" ] && parts="${parts:+$parts > }$task"
-    [ -n "$parts" ] && breadcrumb=" | $parts"
+    fi
   fi
 fi
 
-# --- Assemble ---
-printf "%s" "${ctx_label} | ${model} | ${stage}${rigor:+ · $rigor}${breadcrumb}"
+# ---- render statusline (no ANSI colors - emoji only) ----
+printf '📁 %s' "$current_dir"
+
+# git display
+if [ -n "$git_branch" ]; then
+  printf '  🌿 %s' "$git_branch"
+fi
+
+printf '  🤖 %s' "$model_name"
+
+if [ -n "$model_version" ] && [ "$model_version" != "null" ]; then
+  printf ' %s' "$model_version"
+fi
+
+# session time
+if [ -n "$session_txt" ]; then
+  printf '  ⌛ %s' "$session_txt"
+fi
+
+# cost (only show for API billing mode)
+if [ "$BILLING_MODE" = "api" ] && [ -n "$cost_usd" ] && [[ "$cost_usd" =~ ^[0-9.]+$ ]]; then
+  printf '  💵 $%.4f' "$cost_usd"
+fi
+
+# lines changed
+if [ -n "$lines_added" ] && [ -n "$lines_removed" ] && [[ "$lines_added" =~ ^[0-9]+$ ]] && [[ "$lines_removed" =~ ^[0-9]+$ ]]; then
+  if [ "$lines_added" -gt 0 ] || [ "$lines_removed" -gt 0 ]; then
+    printf '  📝 +%d -%d' "$lines_added" "$lines_removed"
+  fi
+fi
+
+# context window usage (Claude Code v2.0.65+)
+if [ -n "$context_txt" ]; then
+  printf '  %s' "$context_txt"
+fi
+
+# trailing newline (POSIX compliance)
+printf '\n'
